@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — pre-token protocols priced by their launched peers</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="blip" aria-hidden="true"></span>
+    <div>
+      <h1>Token Launch Radar</h1>
+      <p class="tagline">Protocols that record no token yet, priced by the peers that already launched — and how to farm each one.</p>
+    </div>
+  </div>
+  <p class="meta" id="meta"></p>
+</header>
+<nav class="tabs" id="tabs">
+  <button data-view="board" class="tab is-on">Pre-token board</button>
+  <button data-view="live" class="tab">Already trading</button>
+  <button data-view="model" class="tab">The model</button>
+</nav>
+<main id="app" aria-busy="true"></main>
+<footer class="foot">
+  <p>Every implied value is this board's own claim, derived only from the snapshot's figures; it is not a prediction that a token will be issued. A protocol here <em>records</em> no token in DefiLlama's data — that is a record, not a proof. Farm plans are starting points: check the protocol's own page before moving funds.</p>
+</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
