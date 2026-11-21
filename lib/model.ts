@@ -11,7 +11,14 @@
 // dashboard shows the arithmetic for any row a reader opens.
 //
 //   peers(cat)   = launched protocols in the category, ratio_i = mcap_i / tvl_i
-//   ratio(cat)   = (n x median(peers) + 6 x globalMedian) / (n + 6), capped to [0.01, 3]
+//   weight_i     = min(1, tvl_i / tvl_subject): a peer counts in proportion to its size, so
+//                  a $12M peer cannot price a $2.7B protocol on its own
+//   ratio(cat)   = (nEff x weightedMedian(peers) + 6 x globalMedian) / (nEff + 6),
+//                  nEff = the summed weights, capped to [0.01, 3]
+//   range        = the same shrink applied to the weighted p25 and p75, blended with the
+//                  market's own p25 and p75, so a thin peer set shows a wide, honest range
+//   evidence     = a grade A to E read off nEff, printed on every row: A is eight or more
+//                  full-size peers of evidence, E is the market median alone
 //   growthMult   = 1 + clamp(change_7d, -50, 100) / 100 x 0.6        (no report: 1)
 //   maturityMult = 0.78 + 0.42 x (1 - exp(-age_days / 620))          (age unknown: 0.92)
 //   implied      = round(tvl_usd x ratio x growthMult x maturityMult), at least 1
@@ -83,7 +90,7 @@ export const CONSTANTS: RadarConstants = {
   unknown_age_mult: 0.92,
 };
 
-export const MODEL_VERSION = 'peer-radar-2';
+export const MODEL_VERSION = 'peer-radar-3';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -110,11 +117,15 @@ export interface BoardRow {
   model: {
     peer_category: string;
     peer_count: number;
+    peer_weight: number;
+    evidence_grade: string;
     peer_median_ratio: number;
     blended_ratio: number;
     growth_multiplier: number;
     maturity_multiplier: number;
   };
+  farm_capital_usd: number;
+  farm_days: number;
   farm_steps: string[];
 }
 
@@ -135,10 +146,14 @@ export interface RadarRow {
   implied_high_usd: number;
   peer_category: string;
   peer_count: number;
+  peer_weight: number;
+  evidence_grade: string;
   peer_median_ratio: number;
   blended_ratio: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  farm_capital_usd: number;
+  farm_days: number;
   farm_steps: string[];
 }
 
@@ -242,24 +257,43 @@ function categoryKey(p: SnapshotProtocol): string {
   return p.category ?? 'Uncategorized';
 }
 
+/** One launched protocol's evidence: its price per TVL dollar and the size that backs it. */
+export interface PeerPoint {
+  ratio: number;
+  tvl: number;
+}
+
+/** Everything the pricing reads: per-category summaries, the raw peer points, and the market's own spread. */
+export interface PeerBook {
+  stats: Map<string, PeerStats>;
+  lists: Map<string, PeerPoint[]>;
+  globalList: PeerPoint[];
+  globalMedian: number;
+  globalP25: number;
+  globalP75: number;
+}
+
 /**
  * The peer evidence: for every category with at least one launched protocol, the distribution
  * of market cap per TVL dollar among them, and the shrunk ratio the model prices with.
  */
-export function peerStats(snapshot: Snapshot, c: RadarConstants = CONSTANTS): { stats: Map<string, PeerStats>; globalMedian: number } {
+export function peerStats(snapshot: Snapshot, c: RadarConstants = CONSTANTS): PeerBook {
   const launched = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
-  const allRatios = launched.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+  const globalList: PeerPoint[] = launched.map((p) => ({ ratio: p.mcap_usd! / p.tvl_usd, tvl: p.tvl_usd })).sort((a, b) => a.ratio - b.ratio);
+  const allRatios = globalList.map((pt) => pt.ratio);
   const globalMedian = quantile(allRatios, 0.5);
-  const byCategory = new Map<string, number[]>();
+  const lists = new Map<string, PeerPoint[]>();
   for (const p of launched) {
     const key = categoryKey(p);
-    const list = byCategory.get(key);
-    if (list === undefined) byCategory.set(key, [p.mcap_usd! / p.tvl_usd]);
-    else list.push(p.mcap_usd! / p.tvl_usd);
+    const point: PeerPoint = { ratio: p.mcap_usd! / p.tvl_usd, tvl: p.tvl_usd };
+    const list = lists.get(key);
+    if (list === undefined) lists.set(key, [point]);
+    else list.push(point);
   }
   const stats = new Map<string, PeerStats>();
-  for (const [category, ratios] of byCategory) {
-    ratios.sort((a, b) => a - b);
+  for (const [category, points] of lists) {
+    points.sort((a, b) => a.ratio - b.ratio);
+    const ratios = points.map((pt) => pt.ratio);
     const median = quantile(ratios, 0.5);
     const blended = clamp((ratios.length * median + c.shrink_k * globalMedian) / (ratios.length + c.shrink_k), c.ratio_floor, c.ratio_cap);
     stats.set(category, {
@@ -271,14 +305,38 @@ export function peerStats(snapshot: Snapshot, c: RadarConstants = CONSTANTS): { 
       blended_ratio: blended,
     });
   }
-  return { stats, globalMedian };
+  return { stats, lists, globalList, globalMedian, globalP25: quantile(allRatios, 0.25), globalP75: quantile(allRatios, 0.75) };
 }
 
-/** The peer stats a protocol is priced with: its category's, or the market's when it has none. */
-function statsFor(p: SnapshotProtocol, stats: Map<string, PeerStats>, globalMedian: number, c: RadarConstants): PeerStats {
-  const own = stats.get(categoryKey(p));
-  if (own !== undefined) return own;
-  return { category: 'All categories', peers: 0, median_ratio: globalMedian, p25_ratio: globalMedian, p75_ratio: globalMedian, blended_ratio: clamp(globalMedian, c.ratio_floor, c.ratio_cap) };
+/**
+ * The weighted quantile of peer points priced for one subject: each peer weighs
+ * min(1, its TVL / the subject's TVL), so size counts as evidence and a small peer
+ * moves a large protocol's price only a little.
+ */
+function weightedQuantile(points: PeerPoint[], subjectTvl: number, q: number): { value: number; weight: number } {
+  let total = 0;
+  const weighted = points.map((pt) => {
+    const w = Math.min(1, pt.tvl / Math.max(1, subjectTvl));
+    total += w;
+    return { ratio: pt.ratio, w };
+  });
+  if (total <= 0) return { value: 0, weight: 0 };
+  const target = q * total;
+  let acc = 0;
+  for (const pt of weighted) {
+    acc += pt.w;
+    if (acc >= target) return { value: pt.ratio, weight: total };
+  }
+  return { value: weighted[weighted.length - 1]!.ratio, weight: total };
+}
+
+/** The evidence grade a summed peer weight earns: A at eight full-size peers, E below one. */
+export function evidenceGrade(weight: number): string {
+  if (weight >= 8) return 'A';
+  if (weight >= 4) return 'B';
+  if (weight >= 2) return 'C';
+  if (weight >= 0.75) return 'D';
+  return 'E';
 }
 
 /** The two tilts the protocol's own record applies to its category price. */
@@ -291,18 +349,28 @@ export function tilts(p: SnapshotProtocol, asOf: string, c: RadarConstants = CON
 }
 
 /** One protocol's implied value and the evidence behind it. */
-export function price(p: SnapshotProtocol, snapshot: Snapshot, stats: Map<string, PeerStats>, globalMedian: number, c: RadarConstants = CONSTANTS): { implied: number; low: number; high: number; peer: PeerStats; growth: number; maturity: number; age: number | null } {
-  const peer = statsFor(p, stats, globalMedian, c);
+export function price(p: SnapshotProtocol, snapshot: Snapshot, book: PeerBook, c: RadarConstants = CONSTANTS): { implied: number; low: number; high: number; peer: PeerStats; weight: number; grade: string; growth: number; maturity: number; age: number | null } {
+  const own = book.lists.get(categoryKey(p));
+  const points = own !== undefined && own.length > 0 ? own : book.globalList;
+  const label = own !== undefined && own.length > 0 ? categoryKey(p) : 'All categories';
+  const med = weightedQuantile(points, p.tvl_usd, 0.5);
+  const nEff = med.weight;
+  const lo = weightedQuantile(points, p.tvl_usd, 0.25);
+  const hi = weightedQuantile(points, p.tvl_usd, 0.75);
+  const blended = clamp((nEff * med.value + c.shrink_k * book.globalMedian) / (nEff + c.shrink_k), c.ratio_floor, c.ratio_cap);
+  const lowRatio = clamp((nEff * lo.value + c.shrink_k * book.globalP25) / (nEff + c.shrink_k), c.ratio_floor, c.ratio_cap);
+  const highRatio = clamp((nEff * hi.value + c.shrink_k * book.globalP75) / (nEff + c.shrink_k), c.ratio_floor, c.ratio_cap);
+  const peer: PeerStats = { category: label, peers: points.length, median_ratio: med.value, p25_ratio: lo.value, p75_ratio: hi.value, blended_ratio: blended };
   const { growth, maturity, age } = tilts(p, snapshot.as_of, c);
   const tilt = growth * maturity;
-  const implied = Math.max(1, Math.round(p.tvl_usd * peer.blended_ratio * tilt));
-  const lowRatio = clamp((peer.peers * peer.p25_ratio + c.shrink_k * globalMedian) / (peer.peers + c.shrink_k), c.ratio_floor, c.ratio_cap);
-  const highRatio = clamp((peer.peers * peer.p75_ratio + c.shrink_k * globalMedian) / (peer.peers + c.shrink_k), c.ratio_floor, c.ratio_cap);
+  const implied = Math.max(1, Math.round(p.tvl_usd * blended * tilt));
   return {
     implied,
-    low: Math.max(1, Math.round(p.tvl_usd * Math.min(lowRatio, peer.blended_ratio) * tilt)),
-    high: Math.max(implied, Math.round(p.tvl_usd * Math.max(highRatio, peer.blended_ratio) * tilt)),
+    low: Math.max(1, Math.round(p.tvl_usd * Math.min(lowRatio, blended) * tilt)),
+    high: Math.max(implied, Math.round(p.tvl_usd * Math.max(highRatio, blended) * tilt)),
     peer,
+    weight: nEff,
+    grade: evidenceGrade(nEff),
     growth,
     maturity,
     age,
@@ -418,10 +486,10 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
 
 /** The protocols the board ranks, most valuable first, with ranks 1..n and the watchlist covered. */
 export function buildBoard(snapshot: Snapshot, c: RadarConstants = CONSTANTS): BoardRow[] {
-  const { stats, globalMedian } = peerStats(snapshot, c);
+  const book = peerStats(snapshot, c);
   const watch = new Set(snapshot.watchlist);
   const chosen = snapshot.protocols.filter(isRankable);
-  const scored = chosen.map((p) => ({ p, ...price(p, snapshot, stats, globalMedian, c) }));
+  const scored = chosen.map((p) => ({ p, ...price(p, snapshot, book, c) }));
   scored.sort((a, b) => b.implied - a.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,
@@ -440,11 +508,15 @@ export function buildBoard(snapshot: Snapshot, c: RadarConstants = CONSTANTS): B
     model: {
       peer_category: s.peer.category,
       peer_count: s.peer.peers,
+      peer_weight: round4(s.weight),
+      evidence_grade: s.grade,
       peer_median_ratio: round4(s.peer.median_ratio),
       blended_ratio: round4(s.peer.blended_ratio),
       growth_multiplier: round4(s.growth),
       maturity_multiplier: round4(s.maturity),
     },
+    farm_capital_usd: capitalFor(s.p),
+    farm_days: holdDaysFor(s.age),
     farm_steps: farmPlan(s.p, s.age).map(stepText),
   }));
 }
@@ -517,10 +589,14 @@ export function buildRadar(snapshot: Snapshot, c: RadarConstants = CONSTANTS): {
       implied_high_usd: r.implied_high_usd,
       peer_category: r.model.peer_category,
       peer_count: r.model.peer_count,
+      peer_weight: r.model.peer_weight,
+      evidence_grade: r.model.evidence_grade,
       peer_median_ratio: r.model.peer_median_ratio,
       blended_ratio: r.model.blended_ratio,
       growth_multiplier: r.model.growth_multiplier,
       maturity_multiplier: r.model.maturity_multiplier,
+      farm_capital_usd: r.farm_capital_usd,
+      farm_days: r.farm_days,
       farm_steps: r.farm_steps,
     })),
     live,

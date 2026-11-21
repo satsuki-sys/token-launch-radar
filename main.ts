@@ -1,7 +1,9 @@
 // Token Launch Radar — the entry program (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), prices every
-// rankable pre-token protocol with the peer-benchmark model in lib/model.ts, writes the ranked
+// rankable pre-token protocol with the size-weighted peer-benchmark model in lib/model.ts
+// (peer-radar-3: peers weigh in proportion to their size, every row carries an evidence
+// grade and an honest range), writes the ranked
 // board to /output/board.json, writes the dashboard's data to /output/data.js, copies this
 // repository's dashboard/ and screenshots/ into /output, and writes /output/dossier.json with
 // buildDossier from vendor/makefun-board.ts, the summary the judge reads.
@@ -78,6 +80,11 @@ if (shots.length < 3) {
 for (const name of shots) {
   if (!IMAGE_NAME.test(name)) {
     process.stderr.write(`token launch radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
+    process.exit(1);
+  }
+  const bytes = statSync(join(here, 'screenshots', name)).size;
+  if (bytes > SCREENSHOT_CAPS.max_bytes) {
+    process.stderr.write(`token launch radar: screenshots/${name} is ${bytes} bytes, past the ${SCREENSHOT_CAPS.max_bytes}-byte cap the scorer enforces\n`);
     process.exit(1);
   }
 }
